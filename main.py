@@ -4,13 +4,20 @@ import time
 import asyncio
 from datetime import datetime, timezone, timedelta
 import yfinance as yf
-from google import genai
-from google.genai import types
+from groq import Groq
 
-# 1. Cloud Environment Variables ලබාගැනීම
-RAW_KEYS = os.getenv("AI_API_KEY", "")
-API_KEYS = [k.strip() for k in RAW_KEYS.split(",") if k.strip()]
-SYMBOLS = [s.strip() for s in os.getenv("TRADING_SYMBOLS", "XAUUSDm,GBPUSDm").split(",") if s.strip()]
+# 1. Railway Environment Variables ලබාගැනීම
+AI_API_KEY = os.getenv("AI_API_KEY", "").strip()
+SYMBOLS = [s.strip() for s in os.getenv("TRADING_SYMBOLS", "XAUUSDm,GBPUSDm,GBPJPYm,USDCADm").split(",") if s.strip()]
+
+# Groq AI Client සැකසීම
+groq_client = Groq(api_key=AI_API_KEY)
+
+# Groq හි නොමිලේ ලැබෙන ප්‍රබලම AI Models (පළමු එක කාර්යබහුල නම් දෙවැන්නට ස්වයංක්‍රීයව මාරු වේ)
+GROQ_MODELS = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant"
+]
 
 YF_MAP = {
     "XAUUSD": "GC=F", "XAUUSDM": "GC=F", "GOLD": "GC=F",
@@ -41,11 +48,13 @@ def get_price_decimals(symbol):
         return 2
     return 5
 
-# 2. නොමිලේ සජීවී Candles ලබාගැනීම
-def fetch_free_candles(symbol, interval, period, count=40):
+# 2. සජීවී Candles නිවැරදිව ලබාගැනීම
+def fetch_free_candles(symbol, interval, period, count=35):
     ticker = yf.Ticker(get_yf_ticker(symbol))
     df = ticker.history(period=period, interval=interval)
     candles = []
+    if df is None or df.empty:
+        return candles
     for idx, row in df.tail(count).iterrows():
         candles.append({
             "time": str(idx)[:16],
@@ -56,7 +65,7 @@ def fetch_free_candles(symbol, interval, period, count=40):
         })
     return candles
 
-# 3. Step 1: A-Shape, V-Shape සහ Gap Levels ගණනය (2-Time Usage Rule)
+# 3. MSNR Step 1: A-Shape, V-Shape සහ Gap Levels ගණනය (2-Time Usage Rule)
 def scan_snr_levels(candles, timeframe):
     levels = []
     if not candles or len(candles) < 5:
@@ -96,194 +105,166 @@ def scan_snr_levels(candles, timeframe):
 
     return levels[-12:]
 
-# 4. Built-in MSNR Engine (Gemini Quota අවසන් වූ විට කිසිදු බාධාවකින් තොරව 100% නීති පරීක්ෂා කරන පද්ධතිය)
-def builtin_msnr_engine(market_payload):
-    results = {}
-    for sym, data in market_payload.items():
-        cur = data["current_price"]
-        d1_lvls = [l for l in data["d1_levels"] if "Fresh" in l["status"]]
-        w1_lvls = [l for l in data["w1_levels"] if "Fresh" in l["status"]]
-        h4_c = data["h4_candles"]
-        h1_c = data["h1_candles"]
-        m5_c = data["m5_candles"]
+# 4. Groq AI මගින් MSNR නීති 5ට අනුව ගැඹුරින් විශ්ලේෂණය කිරීම
+async def analyze_with_groq_ai(symbol, payload):
+    cur_price = payload["current_price"]
+    pip = get_pip_value(symbol)
 
-        h4_lvls = scan_snr_levels(h4_c, "4H")
-        h1_lvls = scan_snr_levels(h1_c, "1H")
+    system_rules = """You are an institutional MALAYSIAN SNR (MSNR 1.0) Forex AI Trading Engine.
+Strictly apply these MSNR rules:
+1. Storyline (1+2+3 Rule): Price touches a Weekly/Daily Fresh Level (Fresh_Use_1 or Fresh_Use_2) -> Rejects with a wick close -> 1 TF lower (4H/Daily) External Level is broken by a full Candle Body. If Weekly and Daily conflict, follow Daily direction.
+2. HNS Setup Zones: From the 4H breakout structure, identify the best entry zone: APEX (extreme tip), QM (left shoulder), GAP, or SBR_RBS (broken external level).
+3. Refining: Check 1H Fresh levels (must be ABOVE 4H level for SELL, UNDER 4H level for BUY).
+4. Strict Price & Direction Rules:
+   - If Bearish: direction_up_down = "DOWN", position_type = "SHORT (SELL)", entry_price must be a valid resistance level >= current_price (or near current price), and target_price MUST be strictly LOWER than entry_price.
+   - If Bullish: direction_up_down = "UP", position_type = "LONG (BUY)", entry_price must be a valid support level <= current_price (or near current price), and target_price MUST be strictly HIGHER than entry_price."""
 
-        # 4H Candle Body Breakout පරීක්ෂාව
-        last_h4 = h4_c[-1] if h4_c else {"open": cur, "close": cur, "high": cur, "low": cur}
-        prev_h4 = h4_c[-2] if len(h4_c) > 1 else last_h4
-        bull_momentum = last_h4["close"] >= prev_h4["open"]
+    user_prompt = f"""Analyze Symbol: {symbol}
+Current Live Price: {cur_price}
+Pip Value: {pip}
 
-        above_htf = sorted([l["price"] for l in (d1_lvls + w1_lvls) if l["price"] > cur])
-        below_htf = sorted([l["price"] for l in (d1_lvls + w1_lvls) if l["price"] < cur], reverse=True)
+Market Structure Data:
+- Weekly Active SNR Levels: {json.dumps(payload['w1_levels'])}
+- Daily Active SNR Levels: {json.dumps(payload['d1_levels'])}
+- 4H Active SNR Levels: {json.dumps(payload['h4_levels'])}
+- 1H Active SNR Levels: {json.dumps(payload['h1_levels'])}
+- Last 10 4H Candles: {json.dumps(payload['h4_candles'][-10:])}
+- Last 10 1H Candles: {json.dumps(payload['h1_candles'][-10:])}
+- Last 10 5M Candles: {json.dumps(payload['m5_candles'][-10:])}
 
-        # Direction සහ Opposite Fresh Level තෝරාගැනීම
-        if bull_momentum:
-            direction = "UP"
-            pos_type = "LONG (BUY)"
-            opp_fresh = above_htf[0] if above_htf else (cur * 1.01)
-            support_candidates = [l for l in (h4_lvls + h1_lvls) if l["price"] <= cur]
-            if support_candidates:
-                best_lvl = sorted(support_candidates, key=lambda x: abs(cur - x["price"]))[0]
-                entry_price = best_lvl["price"]
-                zone = "APEX" if best_lvl["type"] == "V_SHAPE" else ("GAP" if best_lvl["type"] == "GAP" else "QM")
-            else:
-                entry_price = below_htf[0] if below_htf else cur
-                zone = "APEX"
-        else:
-            direction = "DOWN"
-            pos_type = "SHORT (SELL)"
-            opp_fresh = below_htf[0] if below_htf else (cur * 0.99)
-            resist_candidates = [l for l in (h4_lvls + h1_lvls) if l["price"] >= cur]
-            if resist_candidates:
-                best_lvl = sorted(resist_candidates, key=lambda x: abs(cur - x["price"]))[0]
-                entry_price = best_lvl["price"]
-                zone = "APEX" if best_lvl["type"] == "A_SHAPE" else ("GAP" if best_lvl["type"] == "GAP" else "QM")
-            else:
-                entry_price = above_htf[0] if above_htf else cur
-                zone = "APEX"
+Return ONLY a valid JSON object with these exact keys:
+{{
+  "symbol": "{symbol}",
+  "trade_status": "ACTIVE_ENTRY_NOW" | "WAITING_FOR_PULLBACK_LIMIT",
+  "direction_up_down": "UP" | "DOWN",
+  "position_type": "LONG (BUY)" | "SHORT (SELL)",
+  "setup_zone": "APEX" | "QM" | "GAP" | "SBR_RBS",
+  "entry_price": 0.0,
+  "target_price": 0.0,
+  "reason": "Clear explanation of Daily/Weekly rejection, 4H breakout, and selected HNS zone"
+}}"""
 
-        # මිල Entry කලාපයට ආසන්නදැයි බැලීම
-        pip = get_pip_value(sym)
-        dist_pips = abs(cur - entry_price) / pip
-        status = "ACTIVE_TRADE_SIGNAL" if dist_pips <= 25 else "PENDING_LIMIT_ORDER"
-
-        results[sym] = {
-            "status": status,
-            "direction_up_down": direction,
-            "position_type": pos_type,
-            "setup_zone": zone,
-            "entry_price": entry_price,
-            "opposite_fresh_level": opp_fresh,
-            "reason": f"MSNR {direction} setup mapped at {zone} zone ({round(entry_price, get_price_decimals(sym))}) targeting opposite HTF Fresh level at {round(opp_fresh, get_price_decimals(sym))}."
-        }
-    return results
-
-# 5. Gemini AI + Built-in MSNR Hybrid විශ්ලේෂණය
-async def analyze_all_symbols(market_payload):
-    prompt = f"""
-    You are an automated MALAYSIAN SNR (MSNR 1.0) Forex Trading Engine.
-    Analyze each symbol in the dataset and return the best MSNR setup (APEX, QM, GAP, or SBR_RBS) with exact entry_price, opposite_fresh_level, direction_up_down ("UP" or "DOWN"), and position_type ("LONG (BUY)" or "SHORT (SELL)").
-
-    Market Data:
-    {json.dumps(market_payload)}
-
-    Return ONLY valid JSON where each key is the symbol name:
-    {{
-      "SYMBOL_NAME": {{
-        "status": "ACTIVE_TRADE_SIGNAL" | "PENDING_LIMIT_ORDER",
-        "direction_up_down": "UP" | "DOWN",
-        "position_type": "LONG (BUY)" | "SHORT (SELL)",
-        "setup_zone": "APEX" | "QM" | "GAP" | "SBR_RBS",
-        "entry_price": 0.0,
-        "opposite_fresh_level": 0.0,
-        "reason": "short explanation"
-      }}
-    }}
-    """
-
-    def run_analysis():
-        for api_key in API_KEYS:
+    def call_groq():
+        for model_name in GROQ_MODELS:
             try:
-                client = genai.Client(api_key=api_key)
-                res = client.models.generate_content(
-                    model="gemini-3.8-flash",
-                    contents=prompt,
-                    config=types.GenerateContentConfig(response_mime_type="application/json")
+                completion = groq_client.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {"role": "system", "content": system_rules},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    temperature=0.1,
+                    response_format={"type": "json_object"}
                 )
-                return json.loads(res.text)
-            except Exception:
+                return json.loads(completion.choices[0].message.content)
+            except Exception as e:
+                print(f"[{symbol}] Groq Model ({model_name}) Retry: {e}")
+                time.sleep(2)
                 continue
-        # Gemini Free Quota (20/day) අවසන් වී ඇත්නම් කෙලින්ම Built-in MSNR Engine එක ක්‍රියාත්මක වේ!
-        print("⚡ [Built-in MSNR Engine] Gemini Free Quota අවසන් බැවින් අභ්‍යන්තර MSNR AI Engine මගින් සජීවීව ගණනය කෙරේ...")
-        return builtin_msnr_engine(market_payload)
+        raise Exception("Groq API පරීක්ෂාව අසාර්ථක විය. AI_API_KEY එක නිවැරදිදැයි බලන්න.")
 
-    return await asyncio.to_thread(run_analysis)
+    return await asyncio.to_thread(call_groq)
 
-# 6. ඔබ ඉල්ලූ පැහැදිලි ආකෘතියෙන් (Exact Prices සහිතව) විස්තර පෙන්වීම
-def print_formatted_signal(symbol, current_price, data):
+# 5. කිසිදු පටලැවිල්ලක් නොමැතිව තනි Entry, SL සහ TP මිලක් පමණක් පෙන්වීම
+def print_clean_signal(symbol, current_price, ai_data):
     sl_time = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d %I:%M:%S %p")
     pip = get_pip_value(symbol)
     decimals = get_price_decimals(symbol)
 
-    direction = data.get("direction_up_down", "UP")
-    pos_type = data.get("position_type", "LONG (BUY)")
-    zone = data.get("setup_zone", "APEX")
-    status = data.get("status", "PENDING_LIMIT_ORDER")
+    direction_raw = str(ai_data.get("direction_up_down", "DOWN")).upper()
+    is_up = "UP" in direction_raw
+    direction_label = "UP (ඉහළට)" if is_up else "DOWN (පහළට)"
+    pos_label = "LONG (BUY)" if is_up else "SHORT (SELL)"
 
-    entry = float(data.get("entry_price") or 0.0)
+    zone = str(ai_data.get("setup_zone", "APEX")).upper()
+    status = str(ai_data.get("trade_status", "WAITING_FOR_PULLBACK_LIMIT"))
+
+    entry = float(ai_data.get("entry_price") or 0.0)
     if entry <= 0:
         entry = current_price
 
-    # MSNR නීතියට අනුව APEX සඳහා 30 Pips ද, අනෙක් ඒවාට 20 Pips ද ලෙස SL මිල ගණනය කිරීම
-    sl_pips = 30 if zone == "APEX" else 20
-    tp_pips = 200
+    # MSNR නීතිය: APEX සඳහා 30 Pips, QM/GAP/SBR සඳහා 20 Pips
+    sl_pips = 30 if "APEX" in zone else 20
+    default_tp_pips = 200
+    ai_target = float(ai_data.get("target_price") or 0.0)
 
-    if "UP" in direction or "LONG" in pos_type:
+    # දිශාවට අනුව SL සහ TP මිල ගණිතමයව තහවුරු කිරීම (තනි මිලක් පමණි)
+    if is_up:
         sl_price = round(entry - (sl_pips * pip), decimals)
-        tp_price = round(entry + (tp_pips * pip), decimals)
+        if ai_target > entry + (50 * pip):
+            tp_price = round(ai_target, decimals)
+        else:
+            tp_price = round(entry + (default_tp_pips * pip), decimals)
     else:
         sl_price = round(entry + (sl_pips * pip), decimals)
-        tp_price = round(entry - (tp_pips * pip), decimals)
-
-    opp_lvl = float(data.get("opposite_fresh_level") or tp_price)
+        if 0 < ai_target < entry - (50 * pip):
+            tp_price = round(ai_target, decimals)
+        else:
+            tp_price = round(entry - (default_tp_pips * pip), decimals)
 
     print(
         f"\n========================================\n"
-        f"🕒 TIME (SL)      : {sl_time}\n"
-        f"🪙 COIN / PAIR    : {symbol} (දැන් මිල: {round(current_price, decimals)})\n"
-        f"📊 STATUS         : {status} ({zone} ZONE)\n"
-        f"📈 DIRECTION      : {direction}\n"
-        f"🎯 POSITION TYPE  : {pos_type}\n"
+        f"🕒 TIME           : {sl_time}\n"
+        f"🪙 COIN / PAIR    : {symbol}\n"
+        f"💵 CURRENT PRICE  : {round(current_price, decimals)}\n"
+        f"📊 SETUP STATUS   : {status} ({zone})\n"
+        f"📈 DIRECTION      : {direction_label}\n"
+        f"🎯 TRADE TYPE     : {pos_label}\n"
         f"🔵 ENTRY PRICE    : {round(entry, decimals)}\n"
-        f"🛑 STOP LOSS (SL) : {sl_price}  ({sl_pips} Pips ආරක්ෂාව)\n"
-        f"🟢 TAKE PROFIT(TP): {tp_price}  (200 Pips ඉලක්කය | Next HTF Fresh: {round(opp_lvl, decimals)})\n"
-        f"📝 REASON         : {data.get('reason', '')}\n"
+        f"🛑 STOP LOSS (SL) : {sl_price}\n"
+        f"🟢 TAKE PROFIT(TP): {tp_price}\n"
+        f"📝 AI REASON      : {ai_data.get('reason', 'N/A')}\n"
         f"========================================"
     )
 
-# 7. ප්‍රධාන Cloud Loop එක
+# 6. ප්‍රධාන Cloud Loop එක
 async def main():
-    print("✅ MSNR Unstoppable Cloud Bot සාර්ථකව ආරම්භ විය!")
+    print("🚀 MSNR Groq-AI Cloud Bot (Llama-3.3-70B) සාර්ථකව ආරම්භ විය!")
     last_scan_slot = -1
 
     while True:
         try:
             now = datetime.now(timezone.utc)
-            # සෑම විනාඩි 15කට වරක් අලුත් Signals පරීක්ෂා කිරීම
+            # සෑම විනාඩි 15කට වරක් සියලුම Coins පරීක්ෂා කිරීම
             current_slot = (now.hour * 4) + (now.minute // 15)
 
             if current_slot != last_scan_slot:
                 last_scan_slot = current_slot
-                market_payload = {}
-                current_prices = {}
 
                 for symbol in SYMBOLS:
-                    w1 = await asyncio.to_thread(fetch_free_candles, symbol, "1wk", "1y", 35)
-                    d1 = await asyncio.to_thread(fetch_free_candles, symbol, "1d", "3mo", 35)
-                    h1 = await asyncio.to_thread(fetch_free_candles, symbol, "1h", "1mo", 40)
-                    m5 = await asyncio.to_thread(fetch_free_candles, symbol, "5m", "5d", 25)
-                    h4 = h1[::4]
+                    try:
+                        w1 = await asyncio.to_thread(fetch_free_candles, symbol, "1wk", "1y", 35)
+                        d1 = await asyncio.to_thread(fetch_free_candles, symbol, "1d", "3mo", 35)
+                        h1 = await asyncio.to_thread(fetch_free_candles, symbol, "1h", "1mo", 40)
+                        m5 = await asyncio.to_thread(fetch_free_candles, symbol, "5m", "5d", 25)
 
-                    current_prices[symbol] = m5[-1]["close"] if m5 else (h1[-1]["close"] if h1 else 0.0)
-                    market_payload[symbol] = {
-                        "current_price": current_prices[symbol],
-                        "w1_levels": scan_snr_levels(w1, "1W"),
-                        "d1_levels": scan_snr_levels(d1, "1D"),
-                        "h4_candles": h4[-12:],
-                        "h1_candles": h1[-12:],
-                        "m5_candles": m5[-12:]
-                    }
+                        if not h1 or not d1:
+                            print(f"[{symbol}] Candle දත්ත ලබාගැනීමට නොහැකි විය.")
+                            continue
 
-                decisions = await analyze_all_symbols(market_payload)
+                        h4 = h1[::4]
+                        cur_price = m5[-1]["close"] if m5 else h1[-1]["close"]
 
-                for symbol in SYMBOLS:
-                    sym_data = decisions.get(symbol, {})
-                    print_formatted_signal(symbol, current_prices.get(symbol, 0.0), sym_data)
+                        payload = {
+                            "current_price": cur_price,
+                            "w1_levels": scan_snr_levels(w1, "1W"),
+                            "d1_levels": scan_snr_levels(d1, "1D"),
+                            "h4_levels": scan_snr_levels(h4, "4H"),
+                            "h1_levels": scan_snr_levels(h1, "1H"),
+                            "h4_candles": h4,
+                            "h1_candles": h1,
+                            "m5_candles": m5
+                        }
+
+                        ai_decision = await analyze_with_groq_ai(symbol, payload)
+                        print_clean_signal(symbol, cur_price, ai_decision)
+                        await asyncio.sleep(4)
+
+                    except Exception as sym_err:
+                        print(f"[{symbol}] Analysis Error: {sym_err}")
 
         except Exception as e:
-            print("Scan Error:", e)
+            print("Main Loop Error:", e)
 
         await asyncio.sleep(15)
 
