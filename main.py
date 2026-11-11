@@ -8,7 +8,7 @@ from google import genai
 from google.genai import types
 
 # 1. Cloud Environment Variables ලබාගැනීම
-# (API Keys එකකට වඩා ඇත්නම් කොමාවකින් වෙන් කර AI_API_KEY හි දැමිය හැක)
+# (API Keys එකකට වඩා ඇත්නම් කොමාවකින් වෙන් කර AI_API_KEY හි දැමිය හැක)pakaya
 RAW_KEYS = os.getenv("AI_API_KEY", "")
 API_KEYS = [k.strip() for k in RAW_KEYS.split(",") if k.strip()]
 SYMBOLS = [s.strip() for s in os.getenv("TRADING_SYMBOLS", "XAUUSDm,GBPUSDm").split(",") if s.strip()]
