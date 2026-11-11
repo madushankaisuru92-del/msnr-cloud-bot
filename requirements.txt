@@ -1,4 +1,3 @@
-metaapi-cloud-sdk
-google-genai
-pandas
+groq
 yfinance
+pandas
