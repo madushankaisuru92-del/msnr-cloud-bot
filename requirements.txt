@@ -1,3 +1,4 @@
 metaapi-cloud-sdk
-google-generativeai
+google-genai
 pandas
+yfinance
