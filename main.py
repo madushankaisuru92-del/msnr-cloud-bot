@@ -140,7 +140,7 @@ async def analyze_with_ai(symbol, w1_levels, d1_levels, h4_candles, h1_candles, 
     """
     def call_gemini():
         res = ai_client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.8-flash",
             contents=prompt,
             config=types.GenerateContentConfig(response_mime_type="application/json")
         )
