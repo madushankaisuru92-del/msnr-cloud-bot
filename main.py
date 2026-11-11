@@ -6,7 +6,7 @@ from datetime import datetime, timezone, timedelta
 import yfinance as yf
 from groq import Groq
 
-# 1. Railway Environment Variables ලබාගැනීම
+# 1. Railway Environment Variables ලබාගැනීම pakaya
 AI_API_KEY = os.getenv("AI_API_KEY", "").strip()
 SYMBOLS = [s.strip() for s in os.getenv("TRADING_SYMBOLS", "XAUUSDm,GBPUSDm,GBPJPYm,USDCADm").split(",") if s.strip()]
 
