@@ -25,18 +25,18 @@ AI_API_KEY = load_clean_groq_key()
 RAW_SYMBOLS = os.getenv("TRADING_SYMBOLS", "XAUUSDm,GBPUSDm,GBPJPYm,USDCADm")
 SYMBOLS = [s.strip() for s in RAW_SYMBOLS.split(",") if s.strip()]
 
-# සජීවීව ක්‍රියාත්මක වන Signals සහ Win/Loss වාර්තා තබාගන්නා මතකය
 ACTIVE_TRADES = {}
-SIGNAL_COUNTER = 0
+TRADE_COUNTER = 0
 STATS = {"wins": 0, "losses": 0}
 
+# ප්‍රබලම 70B / 120B / 32B Reasoning Models වලට මුල් තැන දීම
 def discover_groq_chat_models(groq_client):
     try:
         res = groq_client.models.list()
         all_ids = [m.id for m in res.data if getattr(m, "active", True)]
-        skip = ["whisper", "tts", "playai", "guard", "embed", "moderation", "allam", "orpheus"]
+        skip = ["whisper", "tts", "playai", "guard", "embed", "moderation", "allam", "orpheus", "8b"]
         chat_models = [m for m in all_ids if not any(w in m.lower() for w in skip)]
-        priority = ["llama-4", "llama-3.3", "deepseek", "qwen", "gpt", "kimi", "llama-3.1", "gemma"]
+        priority = ["120b", "70b", "qwen3-32b", "deepseek", "kimi", "llama-3.3", "llama-4-maverick", "llama-4"]
         def rank(m_id):
             for idx, kw in enumerate(priority):
                 if kw in m_id.lower():
@@ -77,35 +77,119 @@ def get_price_decimals(symbol):
         return 2
     return 5
 
-def fetch_live_candles(symbol, interval, period, count=30):
+def fetch_live_candles(symbol, interval, period, count=40):
     ticker = yf.Ticker(get_yf_ticker(symbol))
     df = ticker.history(period=period, interval=interval)
     candles = []
     if df is None or df.empty:
         return candles
     for idx, row in df.tail(count).iterrows():
+        o = float(row["Open"])
+        h = float(row["High"])
+        l = float(row["Low"])
+        c = float(row["Close"])
         candles.append({
+            "ts": int(idx.timestamp()),
             "time": str(idx)[11:16],
-            "open": round(float(row["Open"]), 5),
-            "high": round(float(row["High"]), 5),
-            "low": round(float(row["Low"]), 5),
-            "close": round(float(row["Close"]), 5)
+            "open": round(o, 5),
+            "high": round(h, 5),
+            "low": round(l, 5),
+            "close": round(c, 5)
         })
     return candles
 
+# දැන් පවතින සත්‍ය සජීවී මිල (Live Tick Price) පමණක් ලබාගැනීම
+def fetch_exact_live_price(symbol):
+    ticker = yf.Ticker(get_yf_ticker(symbol))
+    df = ticker.history(period="1d", interval="1m")
+    if df is not None and not df.empty:
+        return float(df["Close"].iloc[-1])
+    return None
+
+# ගණිතමය EMA සහ Real-Time Momentum ගණනය කිරීම (AI එකට දිශාව වරදින එක වැළැක්වීමට)
+def compute_ema(prices, period):
+    if not prices:
+        return 0.0
+    k = 2 / (period + 1)
+    ema = prices[0]
+    for p in prices[1:]:
+        ema = (p * k) + (ema * (1 - k))
+    return ema
+
+def analyze_mathematical_trend(m15_candles, m5_candles, m1_candles, pip_val):
+    # අවසාන (තවම හැදෙමින් පවතින) Yahoo පේළිය හැර සම්පූර්ණ වූ Candles ගැනීම
+    c5 = m5_candles[:-1] if len(m5_candles) > 5 else m5_candles
+    c1 = m1_candles[:-1] if len(m1_candles) > 5 else m1_candles
+
+    closes_5m = [c["close"] for c in c5]
+    cur_price = m1_candles[-1]["close"] if m1_candles else closes_5m[-1]
+
+    ema9_5m = compute_ema(closes_5m[-25:], 9)
+    ema21_5m = compute_ema(closes_5m[-25:], 21)
+
+    # පසුගිය විනාඩි 15 සහ විනාඩි 5 තුළ මිල ගමන් කළ සැබෑ දිශාව (Pips වලින්)
+    move_15m_pips = (cur_price - closes_5m[-4]) / pip_val if len(closes_5m) >= 4 else 0.0
+    move_5m_pips = (cur_price - c1[-5]["open"]) / pip_val if len(c1) >= 5 else 0.0
+
+    # අවසාන 5M Candles 3 හි Bodies පරීක්ෂාව
+    bearish_bodies = sum(1 for c in c5[-3:] if c["close"] < c["open"])
+    bullish_bodies = sum(1 for c in c5[-3:] if c["close"] > c["open"])
+
+    score = 0
+    if cur_price > ema9_5m > ema21_5m:
+        score += 2
+    elif cur_price < ema9_5m < ema21_5m:
+        score -= 2
+
+    if move_15m_pips > 1.5:
+        score += 1
+    elif move_15m_pips < -1.5:
+        score -= 1
+
+    if move_5m_pips > 1.0:
+        score += 1
+    elif move_5m_pips < -1.0:
+        score -= 1
+
+    if bullish_bodies >= 2:
+        score += 1
+    elif bearish_bodies >= 2:
+        score -= 1
+
+    if score >= 2:
+        locked_bias = "BULLISH_BUY_ONLY"
+    elif score <= -2:
+        locked_bias = "BEARISH_SELL_ONLY"
+    else:
+        locked_bias = "NEUTRAL_CHOPPY"
+
+    return {
+        "locked_bias": locked_bias,
+        "score": score,
+        "ema9_5m": round(ema9_5m, 5),
+        "ema21_5m": round(ema21_5m, 5),
+        "move_15m_pips": round(move_15m_pips, 1),
+        "move_5m_pips": round(move_5m_pips, 1),
+        "bullish_5m_count": bullish_bodies,
+        "bearish_5m_count": bearish_bodies
+    }
+
 def scan_nearby_snr_levels(candles, timeframe, current_price, max_pips_away, pip_val):
     levels = []
-    if not candles or len(candles) < 5:
+    # සම්පූර්ණ වූ Candles පමණක් භාවිතා කිරීම
+    closed_c = candles[:-1] if len(candles) > 5 else candles
+    if len(closed_c) < 5:
         return levels
-    for i in range(len(candles) - 2):
-        c1, c2 = candles[i], candles[i + 1]
+
+    for i in range(len(closed_c) - 2):
+        c1, c2 = closed_c[i], closed_c[i + 1]
         c1_bull = c1["close"] > c1["open"]
         c2_bull = c2["close"] > c2["open"]
         lvl_type = "A_RESISTANCE" if (c1_bull and not c2_bull) else ("V_SUPPORT" if (not c1_bull and c2_bull) else "GAP_SNR")
         lvl_price = c1["close"]
         status = "Fresh_1"
-        for j in range(i + 2, len(candles)):
-            cj = candles[j]
+        for j in range(i + 2, len(closed_c)):
+            cj = closed_c[j]
             b_high = max(cj["open"], cj["close"])
             b_low = min(cj["open"], cj["close"])
             wick_touch = (cj["low"] <= lvl_price <= cj["high"]) and not (b_low < lvl_price < b_high)
@@ -130,10 +214,14 @@ def scan_nearby_snr_levels(candles, timeframe, current_price, max_pips_away, pip
     return levels[:8]
 
 def calculate_live_atr_pips(m5_candles, pip_val):
-    if not m5_candles or len(m5_candles) < 5:
-        return 10.0
-    ranges = [(c["high"] - c["low"]) / pip_val for c in m5_candles[-10:]]
-    return max(round(sum(ranges) / len(ranges), 1), 3.0)
+    closed_c = m5_candles[:-1] if len(m5_candles) > 6 else m5_candles
+    if len(closed_c) < 5:
+        return 8.0
+    ranges = [(c["high"] - c["low"]) / pip_val for c in closed_c[-10:]]
+    # අසාමාන්‍ය Data Spikes ඉවත් කිරීමට මධ්‍යන්‍යය ගැනීම
+    ranges.sort()
+    trimmed = ranges[1:-1] if len(ranges) > 4 else ranges
+    return max(round(sum(trimmed) / len(trimmed), 1), 3.0)
 
 def extract_json_object(raw_text):
     cleaned = re.sub(r'<think>[\s\S]*?</think>', '', raw_text).strip()
@@ -146,34 +234,39 @@ async def analyze_realtime_scalp_ai(groq_client, available_models, symbol, paylo
     cur_price = payload["current_price"]
     pip = get_pip_value(symbol)
     atr_5m = payload["atr_5m_pips"]
-    decimals = get_price_decimals(symbol)
-    max_offset = round(atr_5m * 2.0 * pip, decimals)
+    trend_info = payload["trend_info"]
+    locked_bias = trend_info["locked_bias"]
 
-    system_rules = f"""You are a Real-Time Intraday & Scalping MSNR Forex AI Engine.
-1. Focus strictly on current 1M, 5M, and 15M price action.
-2. NEVER pick old or distant entry prices. entry_price MUST be Current Live Price ({cur_price}) or within {max_offset} of {cur_price}.
-3. Calculate realistic fast scalping/intraday sl_price and tp_price based on nearby 5M/15M levels and 5M volatility ({atr_5m} pips) so the trade can complete quickly.
-4. For BUY (UP): sl_price < entry_price < tp_price. For SELL (DOWN): tp_price < entry_price < sl_price.
+    system_rules = f"""You are an institutional Real-Time MSNR & Momentum Forex AI Analyst.
+STRICT NON-NEGOTIABLE RULES:
+1. NEVER fight the real-time market momentum! Quantitative pre-analysis shows `{locked_bias}` (Last 15M move: {trend_info['move_15m_pips']} pips, Last 5M move: {trend_info['move_5m_pips']} pips, EMA9={trend_info['ema9_5m']}, EMA21={trend_info['ema21_5m']}).
+   - If `locked_bias` is `BEARISH_SELL_ONLY`: You MUST output `"direction_up_down": "DOWN"` and `"position_type": "SHORT (SELL)"`, or `"signal_valid": false` if structure is unclear. NEVER output BUY when market is dropping!
+   - If `locked_bias` is `BULLISH_BUY_ONLY`: You MUST output `"direction_up_down": "UP"` and `"position_type": "LONG (BUY)"`, or `"signal_valid": false`. NEVER output SELL when market is rising!
+   - If `locked_bias` is `NEUTRAL_CHOPPY`: Only set `"signal_valid": true` if there is an unmistakable 5M MSNR Candle Body Breakout; otherwise set `"signal_valid": false`.
+2. Entry Price is strictly the live price ({cur_price}).
+3. Stop Loss (`sl_price`) and Take Profit (`tp_price`) must be realistic intraday targets based on nearby 5M/15M MSNR levels and 5M volatility ({atr_5m} pips):
+   - For SELL (DOWN): `tp_price` < {cur_price} < `sl_price`
+   - For BUY (UP): `sl_price` < {cur_price} < `tp_price`
 Respond ONLY with valid JSON."""
 
     user_prompt = f"""Symbol: {symbol} | Live Price: {cur_price} | Pip: {pip} | 5M Volatility: {atr_5m} pips
-Nearby 15M Levels: {json.dumps(payload['m15_levels'])}
-Nearby 5M Levels: {json.dumps(payload['m5_levels'])}
-Last 10 15M Candles: {json.dumps(payload['m15_candles'][-10:])}
-Last 10 5M Candles: {json.dumps(payload['m5_candles'][-10:])}
-Last 10 1M Candles: {json.dumps(payload['m1_candles'][-10:])}
+Quantitative Trend & Momentum: {json.dumps(trend_info)}
+Nearby 15M MSNR Levels: {json.dumps(payload['m15_levels'])}
+Nearby 5M MSNR Levels: {json.dumps(payload['m5_levels'])}
+Last 8 Closed 5M Candles (Oldest to Newest): {json.dumps(payload['m5_candles'][-9:-1])}
+Last 8 Closed 1M Candles (Oldest to Newest): {json.dumps(payload['m1_candles'][-9:-1])}
 
 Return ONLY valid JSON:
 {{
   "symbol": "{symbol}",
-  "execution_type": "MARKET_NOW",
+  "signal_valid": true,
   "direction_up_down": "UP" | "DOWN",
   "position_type": "LONG (BUY)" | "SHORT (SELL)",
   "setup_zone": "5M_GAP_BREAK" | "5M_QM_APEX" | "15M_SBR_RBS" | "1M_MOMENTUM_BREAK",
   "entry_price": {cur_price},
   "sl_price": 0.0,
   "tp_price": 0.0,
-  "reason": "Brief explanation of immediate 1M/5M momentum and nearby target level"
+  "reason": "Honest explanation of exact 5M/1M candle direction, EMA alignment, and nearby MSNR target"
 }}"""
 
     def call_groq():
@@ -185,7 +278,7 @@ Return ONLY valid JSON:
                         {"role": "system", "content": system_rules},
                         {"role": "user", "content": user_prompt}
                     ],
-                    temperature=0.1
+                    temperature=0.0
                 )
                 parsed = extract_json_object(comp.choices[0].message.content)
                 parsed["_model_used"] = model_name
@@ -198,48 +291,73 @@ Return ONLY valid JSON:
 
     return await asyncio.to_thread(call_groq)
 
-# අලුත් Signal එකක් ලියාපදිංචි කර Console එකේ පෙන්වීම
-def register_and_print_signal(symbol, current_price, atr_5m_pips, ai_data):
-    global SIGNAL_COUNTER
-    SIGNAL_COUNTER += 1
-    sig_id = f"#{SIGNAL_COUNTER:03d}"
+def register_and_print_signal(symbol, current_price, atr_5m_pips, trend_info, ai_data):
+    global TRADE_COUNTER
+
+    # මාකට් එක Choppy නම් හෝ AI එක Signal එක අවලංගු කළහොත් බොරු Signal නොදී මගහරියි
+    if not ai_data.get("signal_valid", True) or trend_info["locked_bias"] == "NEUTRAL_CHOPPY":
+        print(f"⏳ [{symbol}] දැන් මිල: {current_price} | පැහැදිලි MSNR Setup එකක් නොමැත (Choppy Market - Waiting...)")
+        return
+
+    # AI දුන් දිශාව සහ සැබෑ ගණිතමය Trend එක 100%ක්ම ගැලපෙන බවට තහවුරු කිරීම (Anti-Hallucination Lock)
+    if trend_info["locked_bias"] == "BEARISH_SELL_ONLY":
+        is_up = False
+    elif trend_info["locked_bias"] == "BULLISH_BUY_ONLY":
+        is_up = True
+    else:
+        direction_raw = str(ai_data.get("direction_up_down", "DOWN")).upper()
+        is_up = "UP" in direction_raw
+
+    TRADE_COUNTER += 1
+    trade_num = TRADE_COUNTER
 
     sl_time = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d %I:%M:%S %p")
     pip = get_pip_value(symbol)
     decimals = get_price_decimals(symbol)
 
-    direction_raw = str(ai_data.get("direction_up_down", "DOWN")).upper()
-    is_up = "UP" in direction_raw
     direction_label = "UP (ඉහළට)" if is_up else "DOWN (පහළට)"
     pos_label = "LONG (BUY)" if is_up else "SHORT (SELL)"
-
     zone = str(ai_data.get("setup_zone", "5M_MSNR")).upper()
     model_used = ai_data.get("_model_used", "Groq-AI")
 
-    # සජීවීව Win/Loss බැලීමට පහසු වන ලෙස දැන් පවතින මිලෙන්ම Trade එක ආරම්භ කිරීම
     entry = round(current_price, decimals)
-
     raw_sl = float(ai_data.get("sl_price") or 0.0)
     raw_tp = float(ai_data.get("tp_price") or 0.0)
-    def_sl_pips = max(round(atr_5m_pips * 2.0, 1), 6.0)
-    def_tp_pips = max(round(atr_5m_pips * 3.5, 1), 12.0)
+
+    def_sl_pips = max(round(atr_5m_pips * 2.2, 1), 6.0)
+    def_tp_pips = max(round(atr_5m_pips * 3.8, 1), 10.0)
 
     if is_up:
         sl_dist = (entry - raw_sl) / pip if raw_sl > 0 else 0
-        sl_price = round(raw_sl, decimals) if (3.0 <= sl_dist <= atr_5m_pips * 5.0) else round(entry - (def_sl_pips * pip), decimals)
+        sl_price = round(raw_sl, decimals) if (4.0 <= sl_dist <= atr_5m_pips * 5.0) else round(entry - (def_sl_pips * pip), decimals)
         tp_dist = (raw_tp - entry) / pip if raw_tp > 0 else 0
-        tp_price = round(raw_tp, decimals) if (5.0 <= tp_dist <= atr_5m_pips * 8.0) else round(entry + (def_tp_pips * pip), decimals)
+        tp_price = round(raw_tp, decimals) if (6.0 <= tp_dist <= atr_5m_pips * 8.0) else round(entry + (def_tp_pips * pip), decimals)
     else:
         sl_dist = (raw_sl - entry) / pip if raw_sl > 0 else 0
-        sl_price = round(raw_sl, decimals) if (3.0 <= sl_dist <= atr_5m_pips * 5.0) else round(entry + (def_sl_pips * pip), decimals)
+        sl_price = round(raw_sl, decimals) if (4.0 <= sl_dist <= atr_5m_pips * 5.0) else round(entry + (def_sl_pips * pip), decimals)
         tp_dist = (entry - raw_tp) / pip if raw_tp > 0 else 0
-        tp_price = round(raw_tp, decimals) if (5.0 <= tp_dist <= atr_5m_pips * 8.0) else round(entry - (def_tp_pips * pip), decimals)
+        tp_price = round(raw_tp, decimals) if (6.0 <= tp_dist <= atr_5m_pips * 8.0) else round(entry - (def_tp_pips * pip), decimals)
 
     final_sl_pips = round(abs(entry - sl_price) / pip, 1)
     final_tp_pips = round(abs(tp_price - entry) / pip, 1)
+    reason_text = ai_data.get("reason", "N/A")
+
+    # මුලින් දුන් Signal එක පසුව Win/Loss වූ විට ඒ ආකාරයෙන්ම පෙන්වීම සඳහා Save කර තබාගැනීම
+    given_signal_block = (
+        f"   🔢 TRADE NUMBER   : Trade Number {trade_num}\n"
+        f"   🕒 GIVEN TIME     : {sl_time}\n"
+        f"   🤖 AI ENGINE      : {model_used}\n"
+        f"   🪙 COIN / PAIR    : {symbol}\n"
+        f"   📈 DIRECTION      : {direction_label} ({zone})\n"
+        f"   🎯 TRADE TYPE     : {pos_label}\n"
+        f"   🔵 ENTRY PRICE    : {entry}\n"
+        f"   🛑 STOP LOSS (SL) : {sl_price}  ({final_sl_pips} Pips)\n"
+        f"   🟢 TAKE PROFIT(TP): {tp_price}  ({final_tp_pips} Pips)\n"
+        f"   📝 AI REASON      : {reason_text}"
+    )
 
     ACTIVE_TRADES[symbol] = {
-        "id": sig_id,
+        "trade_num": trade_num,
         "symbol": symbol,
         "is_up": is_up,
         "pos_label": pos_label,
@@ -248,25 +366,20 @@ def register_and_print_signal(symbol, current_price, atr_5m_pips, ai_data):
         "tp": tp_price,
         "sl_pips": final_sl_pips,
         "tp_pips": final_tp_pips,
-        "opened_at": sl_time
+        "opened_at_str": sl_time,
+        "opened_epoch": time.time(),
+        "given_signal_text": given_signal_block
     }
 
     print(
         f"\n========================================\n"
-        f"🆔 SIGNAL NUMBER  : {sig_id} (LIVE TRACKING STARTED)\n"
-        f"🕒 TIME (SL)      : {sl_time}\n"
-        f"🤖 AI ENGINE      : {model_used}\n"
-        f"🪙 COIN / PAIR    : {symbol}\n"
-        f"📈 DIRECTION      : {direction_label} ({zone})\n"
-        f"🎯 TRADE TYPE     : {pos_label}\n"
-        f"🔵 ENTRY PRICE    : {entry}\n"
-        f"🛑 STOP LOSS (SL) : {sl_price}  ({final_sl_pips} Pips)\n"
-        f"🟢 TAKE PROFIT(TP): {tp_price}  ({final_tp_pips} Pips)\n"
-        f"📝 LIVE REASON    : {ai_data.get('reason', 'N/A')}\n"
+        f"🔔 NEW SIGNAL GENERATED : TRADE NUMBER {trade_num}\n"
+        f"========================================\n"
+        f"{given_signal_block}\n"
         f"========================================"
     )
 
-# ක්‍රියාත්මක වන Signals වල TP හෝ SL වැදී ඇත්දැයි පරීක්ෂා කර වෙනමම කැපී පෙනෙන ලෙස පෙන්වීම
+# Signal එක දුන් වෙලාවෙන් පසුව එන සත්‍ය සජීවී මිල (Live Price) පමණක් පරීක්ෂා කර Win/Loss තීරණය කිරීම
 async def check_active_trades_status():
     if not ACTIVE_TRADES:
         return
@@ -274,78 +387,82 @@ async def check_active_trades_status():
     closed_symbols = []
     for symbol, trade in list(ACTIVE_TRADES.items()):
         try:
-            m1 = await asyncio.to_thread(fetch_live_candles, symbol, "1m", "1d", 3)
-            if not m1:
+            # Signal එක දී අවම වශයෙන් තත්පර 15ක් ගතවන තුරු පරණ දත්ත නොබලයි
+            if time.time() - trade["opened_epoch"] < 15:
                 continue
 
-            last_c = m1[-1]
-            c_high = last_c["high"]
-            c_low = last_c["low"]
-            c_close = last_c["close"]
+            live_price = await asyncio.to_thread(fetch_exact_live_price, symbol)
+            if live_price is None:
+                continue
+
+            decimals = get_price_decimals(symbol)
+            live_price = round(live_price, decimals)
+            pip = get_pip_value(symbol)
 
             outcome = None
-            hit_price = c_close
-            pips_result = 0.0
+            pips_moved = 0.0
 
+            # සත්‍ය සජීවී මිල (Live Price) මගින් පමණක් TP සහ SL පරීක්ෂාව (පරණ High/Low කිසිවිටෙකත් නොගනී)
             if trade["is_up"]:
-                if c_high >= trade["tp"] or c_close >= trade["tp"]:
+                if live_price >= trade["tp"]:
                     outcome = "WIN"
-                    hit_price = trade["tp"]
-                    pips_result = trade["tp_pips"]
-                elif c_low <= trade["sl"] or c_close <= trade["sl"]:
+                    pips_moved = round((live_price - trade["entry"]) / pip, 1)
+                elif live_price <= trade["sl"]:
                     outcome = "LOSS"
-                    hit_price = trade["sl"]
-                    pips_result = trade["sl_pips"]
+                    pips_moved = round((trade["entry"] - live_price) / pip, 1)
             else:
-                if c_low <= trade["tp"] or c_close <= trade["tp"]:
+                if live_price <= trade["tp"]:
                     outcome = "WIN"
-                    hit_price = trade["tp"]
-                    pips_result = trade["tp_pips"]
-                elif c_high >= trade["sl"] or c_close >= trade["sl"]:
+                    pips_moved = round((trade["entry"] - live_price) / pip, 1)
+                elif live_price >= trade["sl"]:
                     outcome = "LOSS"
-                    hit_price = trade["sl"]
-                    pips_result = trade["sl_pips"]
+                    pips_moved = round((live_price - trade["entry"]) / pip, 1)
 
             if outcome:
                 closed_time = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d %I:%M:%S %p")
+                t_num = trade["trade_num"]
+
+                # 0.10 Lot සහ 0.01 Lot සඳහා සැබෑ USD ලාභය/පාඩුව ගණනය කිරීම (1 Pip ≈ $1 on 0.10 Lot, $0.10 on 0.01 Lot)
+                usd_010 = round(pips_moved * 1.0, 2)
+                usd_001 = round(pips_moved * 0.10, 2)
+
                 if outcome == "WIN":
                     STATS["wins"] += 1
-                    header = "🏆✨  SIGNAL RESULT : TRADE WON (TP HIT!)  ✨🏆"
-                    pips_str = f"+{pips_result} Pips (WIN ✅)"
+                    title_banner = f"🏆  TRADE NUMBER {t_num} : WIN ✅"
+                    amount_line = f"💰 WON AMOUNT     : +{pips_moved} Pips  (💵 +${usd_010:.2f} on 0.10 Lot | +${usd_001:.2f} on 0.01 Lot)"
                 else:
                     STATS["losses"] += 1
-                    header = "❌💔  SIGNAL RESULT : TRADE LOST (SL HIT)  💔❌"
-                    pips_str = f"-{pips_result} Pips (LOSS ❌)"
+                    title_banner = f"❌  TRADE NUMBER {t_num} : LOSS ❌"
+                    amount_line = f"💸 LOST AMOUNT    : -{pips_moved} Pips  (💵 -${usd_010:.2f} on 0.10 Lot | -${usd_001:.2f} on 0.01 Lot)"
 
                 total = STATS["wins"] + STATS["losses"]
                 win_rate = round((STATS["wins"] / total) * 100, 1) if total > 0 else 0.0
 
-                # අනෙක් Signals වලින් පැහැදිලිව වෙන් වී පෙනීමට ඉහළින් සහ පහළින් හිස් පේළි 4 බැගින් තබා ඇත
+                # ඔබ ඉල්ලූ පරිදි ඉහළින් සහ පහළින් හිස් පේළි තබා, මුලින් දුන් සම්පූර්ණ Signal එකත් (GIVEN SIGNAL) සමඟම පෙන්වීම
                 print(
                     f"\n\n\n\n"
-                    f"************************************************************\n"
-                    f"{header}\n"
-                    f"************************************************************\n"
-                    f"   🆔 SIGNAL NUMBER  : {trade['id']}\n"
-                    f"   🪙 COIN / PAIR    : {symbol} ({trade['pos_label']})\n"
-                    f"   🔵 ENTRY PRICE    : {trade['entry']}\n"
-                    f"   🏁 EXIT PRICE     : {hit_price}\n"
-                    f"   💰 PROFIT / LOSS  : {pips_str}\n"
-                    f"   🕒 CLOSED TIME    : {closed_time}\n"
-                    f"   📊 SCOREBOARD     : Wins: {STATS['wins']} | Losses: {STATS['losses']} | Win Rate: {win_rate}%\n"
-                    f"************************************************************"
+                    f"============================================================\n"
+                    f"{title_banner}\n"
+                    f"============================================================\n"
+                    f"{amount_line}\n"
+                    f"🏁 LIVE EXIT PRICE: {live_price}  (Closed at {closed_time})\n"
+                    f"📊 REAL RECORD    : Total Wins: {STATS['wins']} | Total Losses: {STATS['losses']} | Win Rate: {win_rate}%\n"
+                    f"------------------------------------------------------------\n"
+                    f"📌 GIVEN SIGNAL (මුලින් ලබාදුන් සිග්නල් එක):\n"
+                    f"{trade['given_signal_text']}\n"
+                    f"============================================================"
                     f"\n\n\n\n"
                 )
                 closed_symbols.append(symbol)
 
         except Exception as e:
-            print(f"[{symbol}] Trade Check Error: {e}")
+            print(f"[{symbol}] Live Price Check Error: {e}")
 
     for sym in closed_symbols:
         ACTIVE_TRADES.pop(sym, None)
 
 async def main():
-    print("⚡ MSNR Real-Time AI Bot (With Auto WIN/LOSS Tracker) ආරම්භ විය!")
+    print("⚡ MSNR 100% Real-Data & Verified Tick Tracker Bot ආරම්භ විය!")
     if not AI_API_KEY:
         print("❌ ERROR: Groq API Key not found!")
         return
@@ -356,51 +473,58 @@ async def main():
         print("❌ ERROR: No active Groq models found.")
         return
 
-    print(f"✅ Active AI Engine: {available_models[0]}")
+    print(f"✅ Primary Reasoning AI Model: {available_models[0]}")
     last_scan_slot = -1
 
     while True:
         try:
-            # 1. සෑම තත්පර 30කට වරක් දැනට විවෘතව ඇති Signals WIN ද LOSS ද කියා පරීක්ෂා කිරීම
+            # 1. සෑම තත්පර 15කට වරක් දැනට විවෘතව ඇති Signals වල සත්‍ය සජීවී මිල (Live Price) පරීක්ෂා කිරීම
             await check_active_trades_status()
 
-            # 2. විනාඩි 3කට වරක් (දැනට Active Signal එකක් නොමැති Coins සඳහා පමණක්) අලුත් Signal එකක් සෙවීම
+            # 2. විනාඩි 3කට වරක් අලුත් Signals පරීක්ෂා කිරීම
             now = datetime.now(timezone.utc)
             current_slot = (now.hour * 20) + (now.minute // 3)
             if current_slot != last_scan_slot:
                 last_scan_slot = current_slot
                 for symbol in SYMBOLS:
-                    # මෙම Coin එකට දැනටමත් Signal එකක් වැඩ කරමින් පවතී නම් එය අවසන් වන තුරු අලුත් එකක් නොදමයි
                     if symbol in ACTIVE_TRADES:
                         continue
                     try:
                         m15 = await asyncio.to_thread(fetch_live_candles, symbol, "15m", "5d", 35)
                         m5 = await asyncio.to_thread(fetch_live_candles, symbol, "5m", "2d", 35)
                         m1 = await asyncio.to_thread(fetch_live_candles, symbol, "1m", "1d", 30)
-                        if not m5 or not m15:
+                        if not m5 or not m15 or not m1:
                             continue
-                        cur_price = m1[-1]["close"] if m1 else m5[-1]["close"]
+
+                        cur_price = m1[-1]["close"]
                         pip = get_pip_value(symbol)
                         atr_5m_pips = calculate_live_atr_pips(m5, pip)
-                        max_search = max(atr_5m_pips * 12, 40.0)
+                        trend_info = analyze_mathematical_trend(m15, m5, m1, pip)
+
+                        # මාකට් එක Choppy නම් AI එකට යවන්නේවත් නැතිව බොරු Signals වැළැක්වීම
+                        if trend_info["locked_bias"] == "NEUTRAL_CHOPPY":
+                            print(f"⏳ [{symbol}] Live: {cur_price} | Market Choppy/Flat (Move 15M: {trend_info['move_15m_pips']}p) -> Skipping weak signal.")
+                            continue
+
+                        max_search = max(atr_5m_pips * 10, 35.0)
                         payload = {
                             "current_price": cur_price,
                             "atr_5m_pips": atr_5m_pips,
+                            "trend_info": trend_info,
                             "m15_levels": scan_nearby_snr_levels(m15, "15M", cur_price, max_search, pip),
                             "m5_levels": scan_nearby_snr_levels(m5, "5M", cur_price, max_search, pip),
-                            "m15_candles": m15,
                             "m5_candles": m5,
-                            "m1_candles": m1 if m1 else m5[-10:]
+                            "m1_candles": m1
                         }
                         ai_decision = await analyze_realtime_scalp_ai(groq_client, available_models, symbol, payload)
-                        register_and_print_signal(symbol, cur_price, atr_5m_pips, ai_decision)
+                        register_and_print_signal(symbol, cur_price, atr_5m_pips, trend_info, ai_decision)
                         await asyncio.sleep(3)
                     except Exception as sym_err:
                         print(f"[{symbol}] Analysis Error: {sym_err}")
         except Exception as e:
             print("Main Loop Error:", e)
 
-        await asyncio.sleep(30)
+        await asyncio.sleep(15)
 
 if __name__ == "__main__":
     asyncio.run(main())
