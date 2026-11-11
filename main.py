@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import time
 import asyncio
@@ -6,14 +7,31 @@ from datetime import datetime, timezone, timedelta
 import yfinance as yf
 from groq import Groq
 
-# 1. Railway Environment Variables ලබාගැනීම
-AI_API_KEY = os.getenv("AI_API_KEY", "").strip()
-SYMBOLS = [s.strip() for s in os.getenv("TRADING_SYMBOLS", "XAUUSDm,GBPUSDm,GBPJPYm,USDCADm").split(",") if s.strip()]
+# 1. Railway Variables තුළ ඇති Key එකේ සියලුම දෝෂ (Newlines, Spaces, Quotes) ස්වයංක්‍රීයව පිරිසිදු කර ලබාගැනීම
+def load_clean_groq_key():
+    candidates = [
+        os.getenv("AI_API_KEY", ""),
+        os.getenv("GROQ_API_KEY", "")
+    ]
+    # Railway හි වෙනත් නමකින් හෝ හිස්තැනක් සහිතව Variable එක තිබුණද එය ස්වයංක්‍රීයව සොයාගැනීම
+    for k, v in os.environ.items():
+        if v and "gsk_" in v:
+            candidates.append(v)
 
-# Groq AI Client සැකසීම
-groq_client = Groq(api_key=AI_API_KEY)
+    for raw in candidates:
+        if not raw:
+            continue
+        # සියලුම හිස්තැන්, පේළි කැඩීම් (\n, \r) සහ උද්ධෘත ලකුණු ඉවත් කිරීම
+        compact = re.sub(r'[\s"\']+', '', raw)
+        match = re.search(r'(gsk_[A-Za-z0-9_\-]{20,})', compact)
+        if match:
+            return match.group(1)
+    return ""
 
-# Groq හි නොමිලේ ලැබෙන ප්‍රබලම AI Models (පළමු එක කාර්යබහුල නම් දෙවැන්නට ස්වයංක්‍රීයව මාරු වේ)
+AI_API_KEY = load_clean_groq_key()
+RAW_SYMBOLS = os.getenv("TRADING_SYMBOLS", "XAUUSDm,GBPUSDm,GBPJPYm,USDCADm")
+SYMBOLS = [s.strip() for s in RAW_SYMBOLS.split(",") if s.strip()]
+
 GROQ_MODELS = [
     "llama-3.3-70b-versatile",
     "llama-3.1-8b-instant"
@@ -106,7 +124,7 @@ def scan_snr_levels(candles, timeframe):
     return levels[-12:]
 
 # 4. Groq AI මගින් MSNR නීති 5ට අනුව ගැඹුරින් විශ්ලේෂණය කිරීම
-async def analyze_with_groq_ai(symbol, payload):
+async def analyze_with_groq_ai(groq_client, symbol, payload):
     cur_price = payload["current_price"]
     pip = get_pip_value(symbol)
 
@@ -116,8 +134,8 @@ Strictly apply these MSNR rules:
 2. HNS Setup Zones: From the 4H breakout structure, identify the best entry zone: APEX (extreme tip), QM (left shoulder), GAP, or SBR_RBS (broken external level).
 3. Refining: Check 1H Fresh levels (must be ABOVE 4H level for SELL, UNDER 4H level for BUY).
 4. Strict Price & Direction Rules:
-   - If Bearish: direction_up_down = "DOWN", position_type = "SHORT (SELL)", entry_price must be a valid resistance level >= current_price (or near current price), and target_price MUST be strictly LOWER than entry_price.
-   - If Bullish: direction_up_down = "UP", position_type = "LONG (BUY)", entry_price must be a valid support level <= current_price (or near current price), and target_price MUST be strictly HIGHER than entry_price."""
+   - If Bearish: direction_up_down = "DOWN", position_type = "SHORT (SELL)", entry_price must be a valid resistance level, and target_price MUST be strictly LOWER than entry_price.
+   - If Bullish: direction_up_down = "UP", position_type = "LONG (BUY)", entry_price must be a valid support level, and target_price MUST be strictly HIGHER than entry_price."""
 
     user_prompt = f"""Analyze Symbol: {symbol}
 Current Live Price: {cur_price}
@@ -158,14 +176,14 @@ Return ONLY a valid JSON object with these exact keys:
                 )
                 return json.loads(completion.choices[0].message.content)
             except Exception as e:
-                print(f"[{symbol}] Groq Model ({model_name}) Retry: {e}")
+                print(f"[{symbol}] Groq Model ({model_name}) Error: {e}")
                 time.sleep(2)
                 continue
-        raise Exception("Groq API පරීක්ෂාව අසාර්ථක විය. AI_API_KEY එක නිවැරදිදැයි බලන්න.")
+        raise Exception("Groq API පරීක්ෂාව අසාර්ථක විය.")
 
     return await asyncio.to_thread(call_groq)
 
-# 5. කිසිදු පටලැවිල්ලක් නොමැතිව තනි Entry, SL සහ TP මිලක් පමණක් පෙන්වීම
+# 5. තනි Entry, SL සහ TP මිලක් පමණක් පැහැදිලිව පෙන්වීම
 def print_clean_signal(symbol, current_price, ai_data):
     sl_time = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d %I:%M:%S %p")
     pip = get_pip_value(symbol)
@@ -183,12 +201,10 @@ def print_clean_signal(symbol, current_price, ai_data):
     if entry <= 0:
         entry = current_price
 
-    # MSNR නීතිය: APEX සඳහා 30 Pips, QM/GAP/SBR සඳහා 20 Pips
     sl_pips = 30 if "APEX" in zone else 20
     default_tp_pips = 200
     ai_target = float(ai_data.get("target_price") or 0.0)
 
-    # දිශාවට අනුව SL සහ TP මිල ගණිතමයව තහවුරු කිරීම (තනි මිලක් පමණි)
     if is_up:
         sl_price = round(entry - (sl_pips * pip), decimals)
         if ai_target > entry + (50 * pip):
@@ -219,13 +235,22 @@ def print_clean_signal(symbol, current_price, ai_data):
 
 # 6. ප්‍රධාන Cloud Loop එක
 async def main():
-    print("🚀 MSNR Groq-AI Cloud Bot (Llama-3.3-70B) සාර්ථකව ආරම්භ විය!")
+    print("🚀 MSNR Groq-AI Cloud Bot ආරම්භ විය!")
+
+    if not AI_API_KEY:
+        print("❌ ERROR: Railway Variables තුළ 'gsk_' වලින් පටන් ගන්නා Groq Key එකක් හමු නොවීය!")
+        print("දැනට පවතින Variable නම්:", list(os.environ.keys()))
+        return
+
+    masked = f"{AI_API_KEY[:8]}...{AI_API_KEY[-4:]}"
+    print(f"🔑 Loaded Clean Groq Key: {masked} (Length: {len(AI_API_KEY)} chars)")
+
+    groq_client = Groq(api_key=AI_API_KEY)
     last_scan_slot = -1
 
     while True:
         try:
             now = datetime.now(timezone.utc)
-            # සෑම විනාඩි 15කට වරක් සියලුම Coins පරීක්ෂා කිරීම
             current_slot = (now.hour * 4) + (now.minute // 15)
 
             if current_slot != last_scan_slot:
@@ -256,7 +281,7 @@ async def main():
                             "m5_candles": m5
                         }
 
-                        ai_decision = await analyze_with_groq_ai(symbol, payload)
+                        ai_decision = await analyze_with_groq_ai(groq_client, symbol, payload)
                         print_clean_signal(symbol, cur_price, ai_decision)
                         await asyncio.sleep(4)
 
