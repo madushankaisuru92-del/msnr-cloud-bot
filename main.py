@@ -22,8 +22,13 @@ def load_clean_groq_key():
     return ""
 
 AI_API_KEY = load_clean_groq_key()
-RAW_SYMBOLS = os.getenv("TRADING_SYMBOLS", "XAUUSDm")
+RAW_SYMBOLS = os.getenv("TRADING_SYMBOLS", "XAUUSDm,GBPUSDm,GBPJPYm,USDCADm")
 SYMBOLS = [s.strip() for s in RAW_SYMBOLS.split(",") if s.strip()]
+
+# සජීවීව ක්‍රියාත්මක වන Signals සහ Win/Loss වාර්තා තබාගන්නා මතකය
+ACTIVE_TRADES = {}
+SIGNAL_COUNTER = 0
+STATS = {"wins": 0, "losses": 0}
 
 def discover_groq_chat_models(groq_client):
     try:
@@ -142,12 +147,12 @@ async def analyze_realtime_scalp_ai(groq_client, available_models, symbol, paylo
     pip = get_pip_value(symbol)
     atr_5m = payload["atr_5m_pips"]
     decimals = get_price_decimals(symbol)
-    max_offset = round(atr_5m * 2.5 * pip, decimals)
+    max_offset = round(atr_5m * 2.0 * pip, decimals)
 
     system_rules = f"""You are a Real-Time Intraday & Scalping MSNR Forex AI Engine.
 1. Focus strictly on current 1M, 5M, and 15M price action.
-2. NEVER pick old or distant entry prices. entry_price MUST be either Current Live Price ({cur_price}) or within {max_offset} of {cur_price}.
-3. Calculate realistic intraday sl_price and tp_price based on nearby 5M/15M levels and 5M volatility ({atr_5m} pips). Never use a fixed 200-pip TP.
+2. NEVER pick old or distant entry prices. entry_price MUST be Current Live Price ({cur_price}) or within {max_offset} of {cur_price}.
+3. Calculate realistic fast scalping/intraday sl_price and tp_price based on nearby 5M/15M levels and 5M volatility ({atr_5m} pips) so the trade can complete quickly.
 4. For BUY (UP): sl_price < entry_price < tp_price. For SELL (DOWN): tp_price < entry_price < sl_price.
 Respond ONLY with valid JSON."""
 
@@ -161,7 +166,7 @@ Last 10 1M Candles: {json.dumps(payload['m1_candles'][-10:])}
 Return ONLY valid JSON:
 {{
   "symbol": "{symbol}",
-  "execution_type": "MARKET_NOW" | "NEAR_PULLBACK_LIMIT",
+  "execution_type": "MARKET_NOW",
   "direction_up_down": "UP" | "DOWN",
   "position_type": "LONG (BUY)" | "SHORT (SELL)",
   "setup_zone": "5M_GAP_BREAK" | "5M_QM_APEX" | "15M_SBR_RBS" | "1M_MOMENTUM_BREAK",
@@ -193,7 +198,12 @@ Return ONLY valid JSON:
 
     return await asyncio.to_thread(call_groq)
 
-def print_realtime_signal(symbol, current_price, atr_5m_pips, ai_data):
+# අලුත් Signal එකක් ලියාපදිංචි කර Console එකේ පෙන්වීම
+def register_and_print_signal(symbol, current_price, atr_5m_pips, ai_data):
+    global SIGNAL_COUNTER
+    SIGNAL_COUNTER += 1
+    sig_id = f"#{SIGNAL_COUNTER:03d}"
+
     sl_time = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d %I:%M:%S %p")
     pip = get_pip_value(symbol)
     decimals = get_price_decimals(symbol)
@@ -203,53 +213,139 @@ def print_realtime_signal(symbol, current_price, atr_5m_pips, ai_data):
     direction_label = "UP (ඉහළට)" if is_up else "DOWN (පහළට)"
     pos_label = "LONG (BUY)" if is_up else "SHORT (SELL)"
 
-    exec_type = str(ai_data.get("execution_type", "MARKET_NOW")).upper()
     zone = str(ai_data.get("setup_zone", "5M_MSNR")).upper()
     model_used = ai_data.get("_model_used", "Groq-AI")
 
-    entry = float(ai_data.get("entry_price") or current_price)
-    max_dist = max(atr_5m_pips * 3.0, 15.0) * pip
-    if entry <= 0 or abs(entry - current_price) > max_dist:
-        entry = current_price
-        exec_type = "MARKET_NOW (LIVE PRICE)"
+    # සජීවීව Win/Loss බැලීමට පහසු වන ලෙස දැන් පවතින මිලෙන්ම Trade එක ආරම්භ කිරීම
+    entry = round(current_price, decimals)
 
     raw_sl = float(ai_data.get("sl_price") or 0.0)
     raw_tp = float(ai_data.get("tp_price") or 0.0)
-    def_sl_pips = max(round(atr_5m_pips * 2.5, 1), 8.0)
-    def_tp_pips = max(round(atr_5m_pips * 5.5, 1), 18.0)
+    def_sl_pips = max(round(atr_5m_pips * 2.0, 1), 6.0)
+    def_tp_pips = max(round(atr_5m_pips * 3.5, 1), 12.0)
 
     if is_up:
         sl_dist = (entry - raw_sl) / pip if raw_sl > 0 else 0
-        sl_price = round(raw_sl, decimals) if (4.0 <= sl_dist <= atr_5m_pips * 6.0) else round(entry - (def_sl_pips * pip), decimals)
+        sl_price = round(raw_sl, decimals) if (3.0 <= sl_dist <= atr_5m_pips * 5.0) else round(entry - (def_sl_pips * pip), decimals)
         tp_dist = (raw_tp - entry) / pip if raw_tp > 0 else 0
-        tp_price = round(raw_tp, decimals) if (8.0 <= tp_dist <= atr_5m_pips * 12.0) else round(entry + (def_tp_pips * pip), decimals)
+        tp_price = round(raw_tp, decimals) if (5.0 <= tp_dist <= atr_5m_pips * 8.0) else round(entry + (def_tp_pips * pip), decimals)
     else:
         sl_dist = (raw_sl - entry) / pip if raw_sl > 0 else 0
-        sl_price = round(raw_sl, decimals) if (4.0 <= sl_dist <= atr_5m_pips * 6.0) else round(entry + (def_sl_pips * pip), decimals)
+        sl_price = round(raw_sl, decimals) if (3.0 <= sl_dist <= atr_5m_pips * 5.0) else round(entry + (def_sl_pips * pip), decimals)
         tp_dist = (entry - raw_tp) / pip if raw_tp > 0 else 0
-        tp_price = round(raw_tp, decimals) if (8.0 <= tp_dist <= atr_5m_pips * 12.0) else round(entry - (def_tp_pips * pip), decimals)
+        tp_price = round(raw_tp, decimals) if (5.0 <= tp_dist <= atr_5m_pips * 8.0) else round(entry - (def_tp_pips * pip), decimals)
 
     final_sl_pips = round(abs(entry - sl_price) / pip, 1)
     final_tp_pips = round(abs(tp_price - entry) / pip, 1)
 
+    ACTIVE_TRADES[symbol] = {
+        "id": sig_id,
+        "symbol": symbol,
+        "is_up": is_up,
+        "pos_label": pos_label,
+        "entry": entry,
+        "sl": sl_price,
+        "tp": tp_price,
+        "sl_pips": final_sl_pips,
+        "tp_pips": final_tp_pips,
+        "opened_at": sl_time
+    }
+
     print(
         f"\n========================================\n"
+        f"🆔 SIGNAL NUMBER  : {sig_id} (LIVE TRACKING STARTED)\n"
         f"🕒 TIME (SL)      : {sl_time}\n"
         f"🤖 AI ENGINE      : {model_used}\n"
         f"🪙 COIN / PAIR    : {symbol}\n"
-        f"💵 LIVE PRICE     : {round(current_price, decimals)}\n"
-        f"⚡ EXECUTION      : {exec_type} ({zone})\n"
-        f"📈 DIRECTION      : {direction_label}\n"
+        f"📈 DIRECTION      : {direction_label} ({zone})\n"
         f"🎯 TRADE TYPE     : {pos_label}\n"
-        f"🔵 ENTRY PRICE    : {round(entry, decimals)}\n"
+        f"🔵 ENTRY PRICE    : {entry}\n"
         f"🛑 STOP LOSS (SL) : {sl_price}  ({final_sl_pips} Pips)\n"
         f"🟢 TAKE PROFIT(TP): {tp_price}  ({final_tp_pips} Pips)\n"
         f"📝 LIVE REASON    : {ai_data.get('reason', 'N/A')}\n"
         f"========================================"
     )
 
+# ක්‍රියාත්මක වන Signals වල TP හෝ SL වැදී ඇත්දැයි පරීක්ෂා කර වෙනමම කැපී පෙනෙන ලෙස පෙන්වීම
+async def check_active_trades_status():
+    if not ACTIVE_TRADES:
+        return
+
+    closed_symbols = []
+    for symbol, trade in list(ACTIVE_TRADES.items()):
+        try:
+            m1 = await asyncio.to_thread(fetch_live_candles, symbol, "1m", "1d", 3)
+            if not m1:
+                continue
+
+            last_c = m1[-1]
+            c_high = last_c["high"]
+            c_low = last_c["low"]
+            c_close = last_c["close"]
+
+            outcome = None
+            hit_price = c_close
+            pips_result = 0.0
+
+            if trade["is_up"]:
+                if c_high >= trade["tp"] or c_close >= trade["tp"]:
+                    outcome = "WIN"
+                    hit_price = trade["tp"]
+                    pips_result = trade["tp_pips"]
+                elif c_low <= trade["sl"] or c_close <= trade["sl"]:
+                    outcome = "LOSS"
+                    hit_price = trade["sl"]
+                    pips_result = trade["sl_pips"]
+            else:
+                if c_low <= trade["tp"] or c_close <= trade["tp"]:
+                    outcome = "WIN"
+                    hit_price = trade["tp"]
+                    pips_result = trade["tp_pips"]
+                elif c_high >= trade["sl"] or c_close >= trade["sl"]:
+                    outcome = "LOSS"
+                    hit_price = trade["sl"]
+                    pips_result = trade["sl_pips"]
+
+            if outcome:
+                closed_time = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d %I:%M:%S %p")
+                if outcome == "WIN":
+                    STATS["wins"] += 1
+                    header = "🏆✨  SIGNAL RESULT : TRADE WON (TP HIT!)  ✨🏆"
+                    pips_str = f"+{pips_result} Pips (WIN ✅)"
+                else:
+                    STATS["losses"] += 1
+                    header = "❌💔  SIGNAL RESULT : TRADE LOST (SL HIT)  💔❌"
+                    pips_str = f"-{pips_result} Pips (LOSS ❌)"
+
+                total = STATS["wins"] + STATS["losses"]
+                win_rate = round((STATS["wins"] / total) * 100, 1) if total > 0 else 0.0
+
+                # අනෙක් Signals වලින් පැහැදිලිව වෙන් වී පෙනීමට ඉහළින් සහ පහළින් හිස් පේළි 4 බැගින් තබා ඇත
+                print(
+                    f"\n\n\n\n"
+                    f"************************************************************\n"
+                    f"{header}\n"
+                    f"************************************************************\n"
+                    f"   🆔 SIGNAL NUMBER  : {trade['id']}\n"
+                    f"   🪙 COIN / PAIR    : {symbol} ({trade['pos_label']})\n"
+                    f"   🔵 ENTRY PRICE    : {trade['entry']}\n"
+                    f"   🏁 EXIT PRICE     : {hit_price}\n"
+                    f"   💰 PROFIT / LOSS  : {pips_str}\n"
+                    f"   🕒 CLOSED TIME    : {closed_time}\n"
+                    f"   📊 SCOREBOARD     : Wins: {STATS['wins']} | Losses: {STATS['losses']} | Win Rate: {win_rate}%\n"
+                    f"************************************************************"
+                    f"\n\n\n\n"
+                )
+                closed_symbols.append(symbol)
+
+        except Exception as e:
+            print(f"[{symbol}] Trade Check Error: {e}")
+
+    for sym in closed_symbols:
+        ACTIVE_TRADES.pop(sym, None)
+
 async def main():
-    print("⚡ MSNR Real-Time Scalping & Intraday AI Bot ආරම්භ විය!")
+    print("⚡ MSNR Real-Time AI Bot (With Auto WIN/LOSS Tracker) ආරම්භ විය!")
     if not AI_API_KEY:
         print("❌ ERROR: Groq API Key not found!")
         return
@@ -260,16 +356,23 @@ async def main():
         print("❌ ERROR: No active Groq models found.")
         return
 
-    print(f"✅ Active AI Engine: {available_models[0]} (Scanning every 3 minutes)")
+    print(f"✅ Active AI Engine: {available_models[0]}")
     last_scan_slot = -1
 
     while True:
         try:
+            # 1. සෑම තත්පර 30කට වරක් දැනට විවෘතව ඇති Signals WIN ද LOSS ද කියා පරීක්ෂා කිරීම
+            await check_active_trades_status()
+
+            # 2. විනාඩි 3කට වරක් (දැනට Active Signal එකක් නොමැති Coins සඳහා පමණක්) අලුත් Signal එකක් සෙවීම
             now = datetime.now(timezone.utc)
             current_slot = (now.hour * 20) + (now.minute // 3)
             if current_slot != last_scan_slot:
                 last_scan_slot = current_slot
                 for symbol in SYMBOLS:
+                    # මෙම Coin එකට දැනටමත් Signal එකක් වැඩ කරමින් පවතී නම් එය අවසන් වන තුරු අලුත් එකක් නොදමයි
+                    if symbol in ACTIVE_TRADES:
+                        continue
                     try:
                         m15 = await asyncio.to_thread(fetch_live_candles, symbol, "15m", "5d", 35)
                         m5 = await asyncio.to_thread(fetch_live_candles, symbol, "5m", "2d", 35)
@@ -290,13 +393,14 @@ async def main():
                             "m1_candles": m1 if m1 else m5[-10:]
                         }
                         ai_decision = await analyze_realtime_scalp_ai(groq_client, available_models, symbol, payload)
-                        print_realtime_signal(symbol, cur_price, atr_5m_pips, ai_decision)
+                        register_and_print_signal(symbol, cur_price, atr_5m_pips, ai_decision)
                         await asyncio.sleep(3)
                     except Exception as sym_err:
                         print(f"[{symbol}] Analysis Error: {sym_err}")
         except Exception as e:
             print("Main Loop Error:", e)
-        await asyncio.sleep(10)
+
+        await asyncio.sleep(30)
 
 if __name__ == "__main__":
     asyncio.run(main())
