@@ -22,7 +22,7 @@ def load_clean_groq_key():
     return ""
 
 AI_API_KEY = load_clean_groq_key()
-RAW_SYMBOLS = os.getenv("TRADING_SYMBOLS", "XAUUSDm,GBPUSDm,GBPJPYm,USDCADm")
+RAW_SYMBOLS = os.getenv("TRADING_SYMBOLS", "XAUUSDm")
 SYMBOLS = [s.strip() for s in RAW_SYMBOLS.split(",") if s.strip()]
 
 def discover_groq_chat_models(groq_client):
