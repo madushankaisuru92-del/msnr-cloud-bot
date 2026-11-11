@@ -107,7 +107,7 @@ def scan_snr_levels(candles, timeframe):
 
     return levels[-15:]
 
-# 5. Step 2, 3 & 4: AI මගින් Storyline, HNS සහ Entry තීරණය ගැනීම
+# 5. Step 2, 3 & 4: AI මගින් Storyline, HNS සහ Entry තීරණය ගැනීම (Retry ආරක්ෂාව සහිතව)
 async def analyze_with_ai(symbol, w1_levels, d1_levels, h4_candles, h1_candles, m5_candles):
     prompt = f"""
     You are an automated MALAYSIAN SNR (MSNR 1.0) Forex Trading Engine analyzing {symbol}.
@@ -139,24 +139,23 @@ async def analyze_with_ai(symbol, w1_levels, d1_levels, h4_candles, h1_candles, 
     }}
     """
     def call_gemini():
-        res = ai_client.models.generate_content(
-            model="gemini-3.8-flash",
-            contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json")
-        )
-        return json.loads(res.text)
+        for attempt in range(3):
+            try:
+                res = ai_client.models.generate_content(
+                    model="gemini-3.8-flash",
+                    contents=prompt,
+                    config=types.GenerateContentConfig(response_mime_type="application/json")
+                )
+                return json.loads(res.text)
+            except Exception as e:
+                if "503" in str(e) or "UNAVAILABLE" in str(e):
+                    import time
+                    time.sleep(5 * (attempt + 1)) # තත්පර 5ක් හෝ 10ක් ඉඳලා නැවත උත්සාහ කරයි
+                    continue
+                raise e
+        return {"storyline": "NONE", "action": "WAIT", "direction": "NONE", "reason": "Server busy"}
 
     return await asyncio.to_thread(call_gemini)
-
-def get_pip_value(symbol):
-    if "JPY" in symbol.upper():
-        return 0.01
-    if "XAU" in symbol.upper() or "GOLD" in symbol.upper():
-        return 0.10
-    if "NAS" in symbol.upper() or "BTC" in symbol.upper() or "USTEC" in symbol.upper():
-        return 1.0
-    return 0.0001
-
 # 6. ප්‍රධාන Cloud Loop එක
 async def main():
     init_db()
